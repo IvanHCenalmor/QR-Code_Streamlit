@@ -1,8 +1,10 @@
-"""Core utilities for generating transparent QR-code PNG images."""
+"""Core utilities for generating QR-code PNG and SVG images."""
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+from html import escape
 from io import BytesIO
 import re
 from urllib.parse import urlparse
@@ -22,12 +24,14 @@ ERROR_CORRECTION_LEVELS = {
 
 @dataclass(frozen=True)
 class QRCodeResult:
-    """Generated QR code and a few useful display properties."""
+    """Generated QR code exports and useful display properties."""
 
     png_bytes: bytes
+    svg_bytes: bytes
     version: int
     module_count: int
     pixel_size: int
+    logo_area_pixels: int
 
 
 def validate_http_url(value: str) -> str:
@@ -74,19 +78,8 @@ def contrast_ratio_against_white(color: str) -> float:
     return 1.05 / (luminance + 0.05)
 
 
-def generate_qr_png(
-    url: str,
-    color: str = "#111827",
-    box_size: int = 12,
-    border: int = 4,
-    error_correction: str = "M",
-) -> QRCodeResult:
-    """Generate a QR code with colored modules and a transparent background."""
+def _build_qr_matrix(url: str, border: int, error_correction: str) -> tuple[list[list[bool]], int]:
     normalized_url = validate_http_url(url)
-    rgba_color = parse_hex_color(color)
-
-    if box_size < 1:
-        raise ValueError("Box size must be at least 1 pixel.")
     if border < 4:
         raise ValueError("The quiet-zone border must be at least 4 modules.")
     if error_correction not in ERROR_CORRECTION_LEVELS:
@@ -99,44 +92,160 @@ def generate_qr_png(
         border=border,
     )
     qr.add_data(normalized_url)
-
     try:
         qr.make(fit=True)
     except DataOverflowError as exc:
         raise ValueError("The URL is too long to fit in a QR code.") from exc
+    return qr.get_matrix(), int(qr.version)
 
-    matrix = qr.get_matrix()
+
+def _logo_area_size(pixel_size: int, logo_area_percent: int) -> int:
+    if not 0 <= logo_area_percent <= 30:
+        raise ValueError("Logo area must be between 0% and 30% of the QR width.")
+    if logo_area_percent == 0:
+        return 0
+    size = round(pixel_size * logo_area_percent / 100)
+    return max(1, size)
+
+
+def _prepare_logo(logo_bytes: bytes, max_size: int) -> Image.Image:
+    try:
+        logo = Image.open(BytesIO(logo_bytes)).convert("RGBA")
+    except Exception as exc:
+        raise ValueError("The logo must be a valid PNG, JPEG, or WebP image.") from exc
+
+    if max_size < 1:
+        raise ValueError("Enable a logo area before adding a logo image.")
+
+    logo.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+    return logo
+
+
+def _svg_color(color: str) -> str:
+    red, green, blue, _ = parse_hex_color(color)
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def generate_qr(
+    url: str,
+    color: str = "#111827",
+    box_size: int = 12,
+    border: int = 4,
+    error_correction: str = "M",
+    logo_area_percent: int = 0,
+    logo_bytes: bytes | None = None,
+) -> QRCodeResult:
+    """Generate PNG and SVG QR exports with an optional centered white logo area."""
+    if box_size < 1:
+        raise ValueError("Box size must be at least 1 pixel.")
+
+    rgba_color = parse_hex_color(color)
+    matrix, version = _build_qr_matrix(url, border, error_correction)
     module_count = len(matrix)
     pixel_size = module_count * box_size
+    logo_area_pixels = _logo_area_size(pixel_size, logo_area_percent)
 
+    logo: Image.Image | None = None
+    if logo_bytes:
+        logo_padding = max(2, round(logo_area_pixels * 0.12))
+        logo = _prepare_logo(logo_bytes, logo_area_pixels - 2 * logo_padding)
+
+    # PNG export: transparent background, except the optional centered white area.
     image = Image.new("RGBA", (pixel_size, pixel_size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-
     for row_index, row in enumerate(matrix):
         for column_index, is_dark in enumerate(row):
-            if not is_dark:
-                continue
+            if is_dark:
+                left = column_index * box_size
+                top = row_index * box_size
+                draw.rectangle(
+                    (left, top, left + box_size - 1, top + box_size - 1),
+                    fill=rgba_color,
+                )
 
-            left = column_index * box_size
-            top = row_index * box_size
-            right = left + box_size - 1
-            bottom = top + box_size - 1
-            draw.rectangle((left, top, right, bottom), fill=rgba_color)
+    if logo_area_pixels:
+        area_left = (pixel_size - logo_area_pixels) // 2
+        area_top = (pixel_size - logo_area_pixels) // 2
+        draw.rectangle(
+            (area_left, area_top, area_left + logo_area_pixels - 1, area_top + logo_area_pixels - 1),
+            fill=(255, 255, 255, 255),
+        )
+        if logo is not None:
+            logo_left = (pixel_size - logo.width) // 2
+            logo_top = (pixel_size - logo.height) // 2
+            image.alpha_composite(logo, (logo_left, logo_top))
 
-    buffer = BytesIO()
-    image.save(buffer, format="PNG", optimize=True)
+    png_buffer = BytesIO()
+    image.save(png_buffer, format="PNG", optimize=True)
+
+    # SVG export uses compact horizontal runs of dark modules.
+    svg_parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{pixel_size}" height="{pixel_size}" '
+        f'viewBox="0 0 {pixel_size} {pixel_size}" shape-rendering="crispEdges">',
+        f'<g fill="{escape(_svg_color(color))}">',
+    ]
+    for row_index, row in enumerate(matrix):
+        start: int | None = None
+        for column_index, is_dark in enumerate(row + [False]):
+            if is_dark and start is None:
+                start = column_index
+            elif not is_dark and start is not None:
+                x = start * box_size
+                y = row_index * box_size
+                width = (column_index - start) * box_size
+                svg_parts.append(f'<rect x="{x}" y="{y}" width="{width}" height="{box_size}"/>')
+                start = None
+    svg_parts.append("</g>")
+
+    if logo_area_pixels:
+        area_left = (pixel_size - logo_area_pixels) // 2
+        area_top = (pixel_size - logo_area_pixels) // 2
+        svg_parts.append(
+            f'<rect x="{area_left}" y="{area_top}" width="{logo_area_pixels}" '
+            f'height="{logo_area_pixels}" fill="#ffffff"/>'
+        )
+        if logo is not None:
+            logo_buffer = BytesIO()
+            logo.save(logo_buffer, format="PNG")
+            encoded_logo = base64.b64encode(logo_buffer.getvalue()).decode("ascii")
+            logo_left = (pixel_size - logo.width) // 2
+            logo_top = (pixel_size - logo.height) // 2
+            svg_parts.append(
+                f'<image x="{logo_left}" y="{logo_top}" width="{logo.width}" height="{logo.height}" '
+                f'href="data:image/png;base64,{encoded_logo}"/>'
+            )
+
+    svg_parts.append("</svg>")
+    svg_bytes = "".join(svg_parts).encode("utf-8")
 
     return QRCodeResult(
-        png_bytes=buffer.getvalue(),
-        version=int(qr.version),
+        png_bytes=png_buffer.getvalue(),
+        svg_bytes=svg_bytes,
+        version=version,
         module_count=module_count,
         pixel_size=pixel_size,
+        logo_area_pixels=logo_area_pixels,
     )
 
 
-def suggested_filename(url: str) -> str:
-    """Create a safe PNG file name based on the URL host."""
+def generate_qr_png(
+    url: str,
+    color: str = "#111827",
+    box_size: int = 12,
+    border: int = 4,
+    error_correction: str = "M",
+) -> QRCodeResult:
+    """Backward-compatible helper for callers that only need the original defaults."""
+    return generate_qr(url, color, box_size, border, error_correction)
+
+
+def suggested_filename(url: str, extension: str = "png") -> str:
+    """Create a safe export file name based on the URL host."""
     normalized_url = validate_http_url(url)
     hostname = urlparse(normalized_url).hostname or "qr-code"
     stem = re.sub(r"[^A-Za-z0-9.-]+", "-", hostname).strip(".-").lower()
-    return f"{stem or 'qr-code'}-qr.png"
+    extension = extension.lower().lstrip(".")
+    if extension not in {"png", "svg"}:
+        raise ValueError("File extension must be PNG or SVG.")
+    return f"{stem or 'qr-code'}-qr.{extension}"

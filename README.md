@@ -1,12 +1,15 @@
 # Transparent QR Code Generator
 
-A small Streamlit app that converts an HTTP or HTTPS URL into a colored QR code and lets the user download it as a PNG with a transparent background.
+A small Streamlit app that converts an HTTP or HTTPS URL into a colored QR code and lets the user download it as PNG or SVG, with optional centered logo space.
 
 ## Features
 
 - URL validation for `http://` and `https://` addresses
 - Interactive QR color picker
 - Transparent PNG output
+- Scalable SVG output
+- Optional centered white area for a logo
+- Optional PNG/JPEG/WebP logo embedding in both PNG and SVG exports
 - Four error-correction levels
 - Configurable module size and quiet zone
 - Scanability warning for low-contrast colors
@@ -73,9 +76,11 @@ The root-level `requirements.txt` provides all packages required by the app.
 └── streamlit_app.py
 ```
 
-## Transparent-background note
+## Logo and transparent-background notes
 
-The quiet zone around a QR code must remain visually empty. Because the PNG is transparent, place it on a plain, light background with strong contrast against the chosen module color. Always test the final design with more than one scanner before publishing it.
+The quiet zone around a QR code must remain visually empty. Because the PNG is transparent outside the QR modules (except for an optional white logo area), place it on a plain, light background with strong contrast against the chosen module color.
+
+A centered logo intentionally covers QR modules, so error correction **H** is recommended for branded codes. Keep the logo area as small as practical and always test the final design with more than one scanner before publishing it.
 
 ## License
 
